@@ -3,145 +3,181 @@
 
 /*
  * REDACT
- * Single-file AR inspection runtime
- * Version 0.1.0
+ * Single-file object inspection application
+ * Target: Lens Studio 5.24.1 / Snap Spectacles
  *
- * Attach this script to one scene object in Lens Studio.
- * Target acquisition must be connected to a supported
- * tracking or detection source before real-world use.
+ * Uses the native ScanModule API.
+ * Scanning is on demand, not continuous object tracking.
  */
 
+ // @input Asset.ScanModule scanModule
+ // @input Asset.Texture targetTexture
+
 var REDACT = {
-    version: "0.1.0",
-    state: "IDLE",
-    target: null,
-    data: null,
-    events: 0
+    version: "0.3.0",
+    state: "INITIALIZING",
+    busy: false,
+    scanCount: 0,
+    lastResults: [],
+    inspection: null
 };
 
-function emit(eventName, payload) {
-    REDACT.events++;
-
-    print(
-        "[REDACT][" + REDACT.state + "] " +
-        eventName +
-        (payload !== undefined ? " " + JSON.stringify(payload) : "")
-    );
+function log(event, detail) {
+    print("[REDACT] " + event +
+        (detail !== undefined ? " " + JSON.stringify(detail) : ""));
 }
 
-function transition(nextState) {
-    if (REDACT.state === nextState) {
+function setState(next) {
+    REDACT.state = next;
+    log("STATE", next);
+}
+
+function fail(reason) {
+    REDACT.busy = false;
+    setState("ERROR");
+    log("SCAN_FAILED", String(reason));
+}
+
+function parseAnnotations(json) {
+    var result;
+
+    try {
+        result = JSON.parse(json);
+    } catch (error) {
+        fail("Invalid ScanModule response: " + error);
         return;
     }
 
-    var previous = REDACT.state;
-    REDACT.state = nextState;
+    var objectContext =
+        result &&
+        result.annotations &&
+        result.annotations[ScanModule.Contexts.Objects];
 
-    emit("STATE_CHANGE", {
-        from: previous,
-        to: nextState
+    var annotations = objectContext && objectContext.annotations;
+
+    if (!Array.isArray(annotations)) {
+        REDACT.lastResults = [];
+        REDACT.inspection = null;
+        REDACT.busy = false;
+        setState("NO_RESULTS");
+        log("NO_OBJECT_ANNOTATIONS");
+        return;
+    }
+
+    REDACT.lastResults = annotations.map(function (item) {
+        return {
+            name: item.name || "Unknown object",
+            confidence: typeof item.confidence === "number"
+                ? item.confidence
+                : null
+        };
     });
-}
 
-function acquire(id, metadata) {
-    if (id === undefined || id === null || String(id) === "") {
-        emit("ERROR", "Invalid target identifier");
-        return false;
-    }
+    REDACT.busy = false;
+    REDACT.scanCount++;
 
-    REDACT.target = String(id);
-    REDACT.data = metadata || null;
-
-    transition("TARGETED");
-    emit("TARGET_ACQUIRED", REDACT.target);
-
-    return true;
-}
-
-function inspect() {
-    if (REDACT.state !== "TARGETED") {
-        emit("REJECTED", "No target ready for inspection");
-        return false;
-    }
-
-    transition("INSPECTING");
-    emit("INSPECTION_STARTED", REDACT.target);
-
-    return true;
-}
-
-function update(metadata) {
-    if (REDACT.target === null) {
-        emit("REJECTED", "No active target");
-        return false;
-    }
-
-    REDACT.data = metadata || null;
-    emit("TARGET_UPDATED", REDACT.target);
-
-    return true;
-}
-
-function stopInspection() {
-    if (REDACT.state !== "INSPECTING") {
-        return false;
-    }
-
-    transition("TARGETED");
-    emit("INSPECTION_STOPPED");
-
-    return true;
-}
-
-function lose() {
-    if (REDACT.target === null) {
+    if (REDACT.lastResults.length === 0) {
+        REDACT.inspection = null;
+        setState("NO_RESULTS");
+        log("NO_OBJECTS_RECOGNIZED");
         return;
     }
 
-    emit("TARGET_LOST", REDACT.target);
+    // Prioritize the highest-confidence annotation when scores exist.
+    REDACT.lastResults.sort(function (a, b) {
+        return (b.confidence || 0) - (a.confidence || 0);
+    });
 
-    REDACT.target = null;
-    REDACT.data = null;
+    REDACT.inspection = {
+        id: "REDACT-" + REDACT.scanCount,
+        name: REDACT.lastResults[0].name,
+        confidence: REDACT.lastResults[0].confidence,
+        annotations: REDACT.lastResults
+    };
 
-    transition("LOST");
+    setState("INSPECTING");
+    log("INSPECTION_RESULT", REDACT.inspection);
 }
 
-function reset() {
-    REDACT.target = null;
-    REDACT.data = null;
-
-    transition("IDLE");
-    emit("RESET");
+function scanFailed(reason) {
+    REDACT.busy = false;
+    setState("SCAN_FAILED");
+    log("SCAN_FAILURE", String(reason));
 }
 
-function status() {
+function scan() {
+    if (REDACT.busy) {
+        log("SCAN_IGNORED", "Scan already in progress");
+        return;
+    }
+
+    if (!script.scanModule) {
+        fail("Assign a ScanModule asset in the Inspector.");
+        return;
+    }
+
+    REDACT.busy = true;
+    REDACT.inspection = null;
+    setState("SCANNING");
+
+    try {
+        if (script.targetTexture) {
+            script.scanModule.scanTarget = script.targetTexture;
+        }
+
+        script.scanModule.scan(
+            [ScanModule.Contexts.Objects],
+            parseAnnotations,
+            scanFailed
+        );
+    } catch (error) {
+        fail(error);
+    }
+}
+
+function clearInspection() {
+    REDACT.inspection = null;
+    REDACT.lastResults = [];
+    setState("READY");
+    log("INSPECTION_CLEARED");
+}
+
+function getStatus() {
     return {
         version: REDACT.version,
         state: REDACT.state,
-        target: REDACT.target,
-        data: REDACT.data,
-        events: REDACT.events
+        busy: REDACT.busy,
+        scanCount: REDACT.scanCount,
+        results: REDACT.lastResults,
+        inspection: REDACT.inspection
     };
 }
 
-// Lens Studio script API
-script.api.acquire = acquire;
-script.api.inspect = inspect;
-script.api.update = update;
-script.api.stopInspection = stopInspection;
-script.api.lose = lose;
-script.api.reset = reset;
-script.api.status = status;
+script.api.scan = scan;
+script.api.clearInspection = clearInspection;
+script.api.getStatus = getStatus;
 
-// Initialize automatically when the Lens starts.
-var startup = script.createEvent("OnStartEvent");
+var startEvent = script.createEvent("OnStartEvent");
 
-startup.bind(function () {
-    REDACT.state = "IDLE";
-    REDACT.target = null;
-    REDACT.data = null;
+startEvent.bind(function () {
+    if (!script.scanModule) {
+        setState("CONFIGURATION_REQUIRED");
+        log("ERROR", "Assign the ScanModule asset in the Inspector.");
+        return;
+    }
 
-    emit("RUNTIME_READY", {
-        version: REDACT.version
-    });
+    if (script.targetTexture) {
+        script.scanModule.scanTarget = script.targetTexture;
+    }
+
+    setState("READY");
+    log("REDACT_READY", REDACT.version);
+    log("ACTION", "Call script.api.scan() to scan for objects.");
+});
+
+// Long press initiates a real ScanModule request.
+var scanEvent = script.createEvent("LongPressStartEvent");
+
+scanEvent.bind(function () {
+    scan();
 });
