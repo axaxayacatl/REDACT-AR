@@ -52,17 +52,6 @@ REDACT distinguishes between actual system output, unavailable information, and 
 
 Object recognition, sensor access, and persistent spatial tracking will only be described as implemented when their functionality has been verified on the target platform.
 
-## Development Status
-
-- [x] Project concept defined
-- [x] Initial interaction flow specified
-- [x] Visual system established
-- [ ] Create the SPECS Base Template project
-- [ ] Implement the inspection interface through CLAD
-- [ ] Test interaction states in Lens Studio preview
-- [ ] Validate supported input and spatial placement
-- [ ] Record a working demonstration
-
 ## Hackathon
 
 Developed for the **Learn AR with SPECS** hackathon, focused on building augmented reality experiences for Snap SPECS.
