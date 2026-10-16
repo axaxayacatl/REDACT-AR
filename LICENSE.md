@@ -26,7 +26,7 @@ This repository notice does not grant rights to third-party software, SDKs, temp
 
 ## Project Status
 
-REDACT is an independent hackathon project in development. It is not an official Snap product and is not endorsed by or affiliated with Snap Inc.
+REDACT is an independently developed project exploring augmented reality interfaces and spatial computing through the Snap SPECS platform. Snap and its associated technologies remain the property of their respective owners.
 
 ## Official Resources
 
