@@ -4,7 +4,6 @@
 
 A minimal augmented reality interface for Snap SPECS, exploring object inspection through spatial computing, technical overlays, and uncertainty-aware information design.
 
-`STATUS: IN DEVELOPMENT`
 
 ## Overview
 
