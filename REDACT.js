@@ -1,93 +1,74 @@
-// REDACT — AR OBJECT INSPECTION SYSTEM
-// Version 1.1.0
-// Lens Studio / Snap Spectacles
-//
-// Workflow: SCAN -> INSPECT -> RELEASE
-//
-// PURPOSE
-// Application/controller layer for an AR object-inspection system.
-// This script does not implement an object-recognition engine.
-// Connect a compatible perception provider through registerScanHandler().
-//
-// SETUP
-// 1. Add this script to a SceneObject in Lens Studio.
-// 2. Connect UI components using the public script.api methods.
-// 3. Register a compatible scanning provider.
-// 4. Send actual detection records to receiveDetections().
-//
-// Detection format:
-// {
-//   name: "Object name",
-//   confidence: 0.94
-// }
-//
-// Confidence may be normalized (0..1) or a percentage (0..100).
-
 "use strict";
 
-//@input Component.Text statusText
-//@input Component.Text resultsText
-//@input Component.Text confidenceText
-//@input SceneObject inspectionPanel
+/*
+ * REDACT — Spectacles Object Inspection Controller
+ * Version: 0.4.0
+ * Target: Lens Studio / Snap Spectacles
+ *
+ * Native APIs:
+ *   - LensStudio:CameraModule
+ *   - ScanModule (when a compatible asset is assigned)
+ *
+ * Camera frames do not automatically perform object recognition.
+ * Real-time custom detection requires a compatible model and inference setup.
+ */
+
+// @input Asset.ScanModule scanModule
+// @input Asset.Texture targetTexture
+// @input bool enableCameraFrames = true
+// @input int cameraId = 0
+
+var CameraModule = null;
+var cameraModule = null;
+var cameraRequest = null;
+var cameraTexture = null;
+var cameraTextureProvider = null;
+var cameraFrameRegistration = null;
 
 var REDACT = {
-    name: "REDACT",
-    version: "1.1.0",
+    version: "0.4.0",
     state: "INITIALIZING",
     busy: false,
     scanCount: 0,
     lastScanAt: null,
     lastError: null,
-    results: [],
-    inspection: null
+    lastResults: [],
+    inspection: null,
+    cameraReady: false,
+    cameraFrameCount: 0,
+    lastCameraFrameAt: null
 };
 
-var CONFIG = {
-    maxResults: 20,
-    minimumConfidence: 0,
-    keepHistory: true,
-    historyLimit: 25
-};
-
-var history = [];
-var stateListeners = [];
-var scanHandler = null;
-var scanTimeoutEvent = null;
-var SCAN_TIMEOUT_SECONDS = 15;
-
-
-// ------------------------------------------------------------
-// UTILITIES
-// ------------------------------------------------------------
+function log(event, detail) {
+    var suffix = "";
+    if (detail !== undefined && detail !== null) {
+        try {
+            suffix = " " + JSON.stringify(detail);
+        } catch (e) {
+            suffix = " " + String(detail);
+        }
+    }
+    print("[REDACT] " + event + suffix);
+}
 
 function timestamp() {
     try {
         return new Date().toISOString();
-    } catch (error) {
+    } catch (e) {
         return null;
     }
 }
 
-function safeString(value) {
-    try {
-        if (typeof value === "string") {
-            return value;
-        }
-
-        return JSON.stringify(value);
-    } catch (error) {
-        return String(value);
-    }
+function setState(nextState) {
+    REDACT.state = nextState;
+    log("STATE", nextState);
 }
 
-function log(event, detail) {
-    var message = "[REDACT] " + event;
-
-    if (detail !== undefined && detail !== null) {
-        message += " " + safeString(detail);
-    }
-
-    print(message);
+function fail(reason, stateName) {
+    REDACT.busy = false;
+    REDACT.lastError = String(reason);
+    setState(stateName || "ERROR");
+    log("ERROR_DETAIL", REDACT.lastError);
 }
 
 function normalizeConfidence(value) {
@@ -102,282 +83,53 @@ function normalizeConfidence(value) {
     return Math.max(0, Math.min(1, value));
 }
 
-function formatConfidence(value) {
-    if (value === null || value === undefined) {
-        return "UNAVAILABLE";
-    }
+function parseAnnotations(json) {
+    var result;
 
-    return Math.round(value * 100) + "%";
-}
-
-
-// ------------------------------------------------------------
-// INTERFACE
-// ------------------------------------------------------------
-
-function updateInterface() {
-    if (script.statusText) {
-        script.statusText.text = "REDACT // " + REDACT.state;
-    }
-
-    if (script.resultsText) {
-        if (REDACT.results.length === 0) {
-            script.resultsText.text = "NO DETECTIONS";
-        } else {
-            var lines = [];
-
-            for (var i = 0; i < REDACT.results.length; i++) {
-                var result = REDACT.results[i];
-
-                lines.push(
-                    String(i + 1).padStart(2, "0") +
-                    "  " +
-                    result.name +
-                    "  [" +
-                    formatConfidence(result.confidence) +
-                    "]"
-                );
-            }
-
-            script.resultsText.text = lines.join("\n");
-        }
-    }
-
-    if (script.confidenceText) {
-        if (REDACT.inspection) {
-            script.confidenceText.text =
-                "SELECTED // " +
-                REDACT.inspection.name +
-                "\nCONFIDENCE // " +
-                formatConfidence(REDACT.inspection.confidence);
-        } else {
-            script.confidenceText.text = "NO ACTIVE INSPECTION";
-        }
-    }
-
-    if (script.inspectionPanel) {
-        script.inspectionPanel.enabled = !!REDACT.inspection;
-    }
-}
-
-function notifyStateListeners() {
-    var snapshot = getStatus();
-
-    for (var i = 0; i < stateListeners.length; i++) {
-        try {
-            stateListeners[i](snapshot);
-        } catch (error) {
-            log("LISTENER_ERROR", String(error));
-        }
-    }
-}
-
-function setState(state) {
-    REDACT.state = state;
-    updateInterface();
-
-    log("STATE", state);
-    notifyStateListeners();
-}
-
-function setError(message, state) {
-    REDACT.busy = false;
-    REDACT.lastError = safeString(message);
-
-    setState(state || "ERROR");
-    log("ERROR_DETAIL", REDACT.lastError);
-}
-
-
-// ------------------------------------------------------------
-// RESULT NORMALIZATION
-// ------------------------------------------------------------
-
-function normalizeDetection(detection, index) {
-    if (!detection || typeof detection !== "object") {
-        return null;
-    }
-
-    var name = typeof detection.name === "string"
-        ? detection.name.trim()
-        : "";
-
-    if (!name) {
-        name = "Unknown object";
-    }
-
-    var confidence = normalizeConfidence(detection.confidence);
-
-    if (
-        confidence !== null &&
-        confidence < CONFIG.minimumConfidence
-    ) {
-        return null;
-    }
-
-    return {
-        index: index,
-        name: name,
-        confidence: confidence,
-        source: typeof detection.source === "string"
-            ? detection.source
-            : "Perception provider",
-        observedAt: timestamp()
-    };
-}
-
-function saveHistory(inspection) {
-    if (!CONFIG.keepHistory || !inspection) {
+    try {
+        result = typeof json === "string" ? JSON.parse(json) : json;
+    } catch (error) {
+        fail("Invalid ScanModule response: " + error, "SCAN_FAILED");
         return;
     }
 
-    history.unshift({
-        id: inspection.id,
-        name: inspection.name,
-        confidence: inspection.confidence,
-        resultCount: inspection.results.length,
-        observedAt: inspection.observedAt
-    });
-
-    if (history.length > CONFIG.historyLimit) {
-        history.length = CONFIG.historyLimit;
-    }
-}
-
-
-// ------------------------------------------------------------
-// PERCEPTION ADAPTER
-// ------------------------------------------------------------
-
-// Register a real, supported scanning provider.
-//
-// Expected handler signature:
-// handler(successCallback, failureCallback)
-//
-// successCallback(detections)
-// failureCallback(error)
-//
-// The provider is responsible for using the actual Lens Studio
-// perception API and returning genuine detection records.
-
-function registerScanHandler(handler) {
-    if (typeof handler !== "function") {
-        log("REGISTRATION_FAILED", "Handler must be a function.");
-        return false;
-    }
-
-    if (REDACT.busy) {
-        log("REGISTRATION_FAILED", "Cannot change provider during a scan.");
-        return false;
-    }
-
-    scanHandler = handler;
-
-    if (REDACT.state === "CONFIGURATION_REQUIRED") {
-        setState("READY");
-    }
-
-    log("PERCEPTION_PROVIDER_REGISTERED");
-    return true;
-}
-
-
-// ------------------------------------------------------------
-// SCAN
-// ------------------------------------------------------------
-
-function scan() {
-    if (REDACT.busy) {
-        log("SCAN_IGNORED", "Scan already in progress.");
-        return false;
-    }
-
-    if (typeof scanHandler !== "function") {
-        setError(
-            "No perception provider registered. Connect a supported scanning API.",
-            "CONFIGURATION_REQUIRED"
-        );
-
-        return false;
-    }
-
-    REDACT.busy = true;
-    REDACT.results = [];
-    REDACT.inspection = null;
-    REDACT.lastError = null;
-    REDACT.lastScanAt = timestamp();
-
-    setState("SCANNING");
-
-    var callbackUsed = false;
-
-    function finishOnce(callback) {
-        if (callbackUsed) {
-            log("DUPLICATE_CALLBACK_IGNORED");
-            return;
-        }
-
-        callbackUsed = true;
-        callback();
-    }
-
-    function onSuccess(detections) {
-        finishOnce(function () {
-            receiveDetections(detections);
-        });
-    }
-
-    function onFailure(error) {
-        finishOnce(function () {
-            setError(
-                error || "Perception provider failed.",
-                "SCAN_FAILED"
-            );
-        });
-    }
+    var objectContext = null;
 
     try {
-        scanHandler(onSuccess, onFailure);
+        objectContext = result &&
+            result.annotations &&
+            result.annotations[ScanModule.Contexts.Objects];
     } catch (error) {
-        onFailure(error);
+        log("ANNOTATION_CONTEXT_WARNING", String(error));
     }
 
-    return true;
-}
+    var annotations = objectContext && objectContext.annotations;
 
-
-// ------------------------------------------------------------
-// DETECTION PROCESSING
-// ------------------------------------------------------------
-
-// Accept an array of actual detections from the registered provider.
-// This method may also be called by a connected script directly.
-
-function receiveDetections(detections) {
-    if (!Array.isArray(detections)) {
-        setError(
-            "Invalid detection response. Expected an array.",
-            "SCAN_FAILED"
-        );
-
-        return false;
+    if (!Array.isArray(annotations)) {
+        REDACT.lastResults = [];
+        REDACT.inspection = null;
+        REDACT.busy = false;
+        REDACT.lastScanAt = timestamp();
+        REDACT.lastError = null;
+        setState("NO_RESULTS");
+        log("NO_OBJECT_ANNOTATIONS");
+        return;
     }
 
-    var normalized = [];
+    REDACT.lastResults = annotations.map(function (item, index) {
+        item = item || {};
 
-    for (
-        var i = 0;
-        i < detections.length && normalized.length < CONFIG.maxResults;
-        i++
-    ) {
-        var detection = normalizeDetection(detections[i], i);
+        return {
+            index: index,
+            name: typeof item.name === "string" && item.name.length
+                ? item.name
+                : "Unknown object",
+            confidence: normalizeConfidence(item.confidence),
+            source: "ScanModule"
+        };
+    });
 
-        if (detection) {
-            normalized.push(detection);
-        }
-    }
-
-    normalized.sort(function (a, b) {
+    REDACT.lastResults.sort(function (a, b) {
         if (a.confidence === null && b.confidence === null) {
             return a.index - b.index;
         }
@@ -394,219 +146,280 @@ function receiveDetections(detections) {
     });
 
     REDACT.busy = false;
-    REDACT.lastScanAt = timestamp();
-    REDACT.results = normalized;
-    REDACT.lastError = null;
     REDACT.scanCount++;
+    REDACT.lastScanAt = timestamp();
+    REDACT.lastError = null;
 
-    if (normalized.length === 0) {
+    if (REDACT.lastResults.length === 0) {
         REDACT.inspection = null;
         setState("NO_RESULTS");
-
-        log("SCAN_COMPLETE", "No matching objects detected.");
-
-        return true;
+        log("NO_OBJECTS_RECOGNIZED");
+        return;
     }
-
-    var selected = normalized[0];
 
     REDACT.inspection = {
         id: "REDACT-" + String(REDACT.scanCount).padStart(4, "0"),
-        name: selected.name,
-        confidence: selected.confidence,
-        results: normalized,
+        name: REDACT.lastResults[0].name,
+        confidence: REDACT.lastResults[0].confidence,
+        annotations: REDACT.lastResults,
         observedAt: REDACT.lastScanAt,
-        source: selected.source,
+        source: "ScanModule",
         status: "OBSERVED"
     };
 
-    saveHistory(REDACT.inspection);
     setState("INSPECTING");
-
-    log("INSPECTION_CREATED", {
-        id: REDACT.inspection.id,
-        name: REDACT.inspection.name,
-        confidence: REDACT.inspection.confidence,
-        results: normalized.length
-    });
-
-    return true;
+    log("INSPECTION_RESULT", REDACT.inspection);
 }
 
+function scanFailed(reason) {
+    fail(
+        reason || "ScanModule reported an unspecified failure.",
+        "SCAN_FAILED"
+    );
+}
 
-// ------------------------------------------------------------
-// INSPECTION / RELEASE
-// ------------------------------------------------------------
+// Requests a single scan from an assigned ScanModule asset.
+function scan() {
+    if (REDACT.busy) {
+        log("SCAN_IGNORED", "A scan is already in progress.");
+        return false;
+    }
+
+    if (
+        typeof ScanModule === "undefined" ||
+        !ScanModule.Contexts ||
+        typeof ScanModule.Contexts.Objects === "undefined"
+    ) {
+        fail(
+            "ScanModule object context is unavailable in this runtime.",
+            "CONFIGURATION_REQUIRED"
+        );
+        return false;
+    }
+
+    if (!script.scanModule) {
+        fail(
+            "Assign a compatible ScanModule asset in the Inspector.",
+            "CONFIGURATION_REQUIRED"
+        );
+        return false;
+    }
+
+    REDACT.busy = true;
+    REDACT.inspection = null;
+    REDACT.lastResults = [];
+    REDACT.lastError = null;
+    REDACT.lastScanAt = timestamp();
+
+    setState("SCANNING");
+
+    try {
+        if (script.targetTexture) {
+            script.scanModule.scanTarget = script.targetTexture;
+        }
+
+        script.scanModule.scan(
+            [ScanModule.Contexts.Objects],
+            parseAnnotations,
+            scanFailed
+        );
+
+        log("SCAN_REQUESTED", {
+            scanNumber: REDACT.scanCount + 1
+        });
+
+        return true;
+    } catch (error) {
+        fail(error, "SCAN_FAILED");
+        return false;
+    }
+}
+
+// Starts native Spectacles camera access.
+// This receives frames but does not itself recognize objects.
+function startCamera() {
+    if (!script.enableCameraFrames) {
+        log("CAMERA_DISABLED");
+        return false;
+    }
+
+    if (REDACT.cameraReady) {
+        return true;
+    }
+
+    try {
+        CameraModule = require("LensStudio:CameraModule");
+        cameraModule = CameraModule;
+        cameraRequest = CameraModule.createCameraRequest();
+
+        if (script.cameraId === 1) {
+            cameraRequest.cameraId =
+                CameraModule.CameraId.Left_Color;
+        } else if (script.cameraId === 2) {
+            cameraRequest.cameraId =
+                CameraModule.CameraId.Right_Color;
+        } else {
+            cameraRequest.cameraId =
+                CameraModule.CameraId.Default_Color;
+        }
+
+        cameraTexture = cameraModule.requestCamera(cameraRequest);
+
+        if (
+            !cameraTexture ||
+            !cameraTexture.control ||
+            !cameraTexture.control.onNewFrame
+        ) {
+            throw new Error(
+                "CameraModule returned no usable CameraTextureProvider."
+            );
+        }
+
+        cameraTextureProvider = cameraTexture.control;
+
+        cameraFrameRegistration =
+            cameraTextureProvider.onNewFrame.add(function (frame) {
+                REDACT.cameraFrameCount++;
+                REDACT.lastCameraFrameAt = timestamp();
+
+                if (REDACT.cameraFrameCount === 1) {
+                    log("CAMERA_FIRST_FRAME", {
+                        timestampMillis:
+                            frame &&
+                            frame.timestampMillis !== undefined
+                                ? frame.timestampMillis
+                                : null
+                    });
+                }
+            });
+
+        REDACT.cameraReady = true;
+
+        log("CAMERA_READY", {
+            cameraId: script.cameraId,
+            frames: "streaming"
+        });
+
+        return true;
+    } catch (error) {
+        REDACT.cameraReady = false;
+        REDACT.lastError = "CameraModule: " + String(error);
+        log("CAMERA_UNAVAILABLE", REDACT.lastError);
+        return false;
+    }
+}
+
+function stopCamera() {
+    try {
+        if (
+            cameraTextureProvider &&
+            cameraFrameRegistration !== null
+        ) {
+            cameraTextureProvider.onNewFrame.remove(
+                cameraFrameRegistration
+            );
+        }
+    } catch (error) {
+        log("CAMERA_STOP_WARNING", String(error));
+    }
+
+    cameraFrameRegistration = null;
+    cameraTextureProvider = null;
+    cameraTexture = null;
+    REDACT.cameraReady = false;
+
+    log("CAMERA_STOPPED");
+}
 
 function clearInspection() {
     if (REDACT.busy) {
-        log("RELEASE_IGNORED", "A scan is currently in progress.");
+        log(
+            "RELEASE_IGNORED",
+            "Cannot release while a scan is in progress."
+        );
         return false;
     }
 
     REDACT.inspection = null;
-    REDACT.results = [];
+    REDACT.lastResults = [];
     REDACT.lastError = null;
 
-    setState(scanHandler ? "READY" : "CONFIGURATION_REQUIRED");
+    setState(
+        script.scanModule
+            ? "READY"
+            : "CONFIGURATION_REQUIRED"
+    );
 
     log("INSPECTION_RELEASED");
-
     return true;
 }
-
-function selectResult(index) {
-    if (
-        typeof index !== "number" ||
-        index < 0 ||
-        index >= REDACT.results.length ||
-        Math.floor(index) !== index
-    ) {
-        return false;
-    }
-
-    var selected = REDACT.results[index];
-
-    REDACT.inspection = {
-        id: "REDACT-" + String(REDACT.scanCount).padStart(4, "0"),
-        name: selected.name,
-        confidence: selected.confidence,
-        results: REDACT.results.slice(0),
-        observedAt: selected.observedAt,
-        source: selected.source,
-        status: "OBSERVED"
-    };
-
-    setState("INSPECTING");
-
-    return true;
-}
-
-
-// ------------------------------------------------------------
-// CONFIGURATION
-// ------------------------------------------------------------
-
-function configure(options) {
-    options = options || {};
-
-    if (
-        typeof options.maxResults === "number" &&
-        isFinite(options.maxResults)
-    ) {
-        CONFIG.maxResults = Math.max(
-            1,
-            Math.min(100, Math.floor(options.maxResults))
-        );
-    }
-
-    if (
-        typeof options.minimumConfidence === "number" &&
-        isFinite(options.minimumConfidence)
-    ) {
-        CONFIG.minimumConfidence = Math.max(
-            0,
-            Math.min(1, options.minimumConfidence)
-        );
-    }
-
-    if (typeof options.keepHistory === "boolean") {
-        CONFIG.keepHistory = options.keepHistory;
-    }
-
-    if (
-        typeof options.historyLimit === "number" &&
-        isFinite(options.historyLimit)
-    ) {
-        CONFIG.historyLimit = Math.max(
-            1,
-            Math.min(100, Math.floor(options.historyLimit))
-        );
-
-        if (history.length > CONFIG.historyLimit) {
-            history.length = CONFIG.historyLimit;
-        }
-    }
-
-    log("CONFIGURATION_UPDATED", CONFIG);
-
-    return getStatus();
-}
-
-
-// ------------------------------------------------------------
-// PUBLIC API
-// ------------------------------------------------------------
 
 function getStatus() {
     return {
-        name: REDACT.name,
         version: REDACT.version,
         state: REDACT.state,
         busy: REDACT.busy,
         scanCount: REDACT.scanCount,
         lastScanAt: REDACT.lastScanAt,
         lastError: REDACT.lastError,
-        results: REDACT.results.slice(0),
+        results: REDACT.lastResults.slice(0),
         inspection: REDACT.inspection,
-        history: history.slice(0)
+        cameraReady: REDACT.cameraReady,
+        cameraFrameCount: REDACT.cameraFrameCount,
+        lastCameraFrameAt: REDACT.lastCameraFrameAt
     };
 }
 
-function getHistory() {
-    return history.slice(0);
-}
-
-function onStateChange(callback) {
-    if (typeof callback !== "function") {
-        return false;
-    }
-
-    stateListeners.push(callback);
-
-    try {
-        callback(getStatus());
-    } catch (error) {
-        log("LISTENER_ERROR", String(error));
-    }
-
-    return true;
-}
-
-
-// Methods exposed to other Lens Studio scripts.
-
+// Public API for other scripts and UI controls.
 script.api.scan = scan;
-script.api.receiveDetections = receiveDetections;
-script.api.registerScanHandler = registerScanHandler;
+script.api.startCamera = startCamera;
+script.api.stopCamera = stopCamera;
 script.api.clearInspection = clearInspection;
 script.api.release = clearInspection;
-script.api.selectResult = selectResult;
 script.api.getStatus = getStatus;
-script.api.getHistory = getHistory;
-script.api.configure = configure;
-script.api.onStateChange = onStateChange;
+script.api.getCameraTexture = function () {
+    return cameraTexture;
+};
 
-
-// ------------------------------------------------------------
-// INITIALIZATION
-// ------------------------------------------------------------
-
+// Initialize when the scene starts.
 var startEvent = script.createEvent("OnStartEvent");
 
 startEvent.bind(function () {
-    updateInterface();
+    if (script.scanModule && script.targetTexture) {
+        try {
+            script.scanModule.scanTarget = script.targetTexture;
+        } catch (error) {
+            log("SCAN_TARGET_WARNING", String(error));
+        }
+    }
 
-    setState("CONFIGURATION_REQUIRED");
+    if (script.enableCameraFrames) {
+        startCamera();
+    }
 
-    log("INITIALIZED", {
-        version: REDACT.version,
-        workflow: "SCAN -> INSPECT -> RELEASE",
-        providerRegistered: false
-    });
-
-    log(
-        "SETUP",
-        "Register a compatible perception provider before scanning."
+    setState(
+        script.scanModule
+            ? "READY"
+            : "CONFIGURATION_REQUIRED"
     );
+
+    log("REDACT_READY", {
+        version: REDACT.version,
+        scanModuleAssigned: !!script.scanModule,
+        cameraFramesEnabled: !!script.enableCameraFrames
+    });
+});
+
+// Clean up the camera frame listener when the object is destroyed.
+var destroyEvent = script.createEvent("OnDestroyEvent");
+
+destroyEvent.bind(function () {
+    stopCamera();
+});
+
+// Optional long-press scan trigger.
+var scanEvent = script.createEvent("LongPressStartEvent");
+
+scanEvent.bind(function () {
+    scan();
 });
